@@ -122,6 +122,18 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('keyup', (e) => keys.delete(e.code));
 
+// Ammunition is kept per weapon: switching away and back restores the exact
+// mag and reserve the weapon had, so a weapon switch is never a free reload.
+const ammoStore = { p9: null, kr7: null, vulture: null, osprey: null };
+function stashAmmo() {
+  ammoStore[playerActor.weapon] = { mag: playerActor.mag, reserve: playerActor.reserve };
+}
+function drawAmmo(key) {
+  const s = ammoStore[key];
+  if (s) { playerActor.mag = s.mag; playerActor.reserve = s.reserve; }
+  else { playerActor.mag = WEAPONS[key].mag; playerActor.reserve = WEAPONS[key].reserve; }
+}
+
 function currentPrimary() {
   return playerActor.ownedPrimary || 'p9';
 }
@@ -138,6 +150,7 @@ function startMatch(team) {
   playerActor.money = ECONOMY.start;
   playerActor.kills = 0;
   playerActor.deaths = 0;
+  playerActor.survived = false;
   startRound();
 }
 
@@ -145,6 +158,12 @@ function restartMatch() {
   state.scores = { lanterns: 0, harbour: 0 };
   state.round = 1;
   state.matchWinner = null;
+  // A fresh match starts on a fresh economy and a clean scorecard, exactly
+  // like startMatch — the old version kept the end-of-match money and K/D.
+  playerActor.money = ECONOMY.start;
+  playerActor.kills = 0;
+  playerActor.deaths = 0;
+  playerActor.survived = false;
   startRound();
 }
 
@@ -162,16 +181,27 @@ function startRound() {
   playerActor.pos = player.state.pos;
   playerActor.hp = 100;
   playerActor.alive = true;
-  if (!playerActor.survived) { playerActor.weapon = 'p9'; playerActor.armor = 0; playerActor.ownedPrimary = null; }
-  playerActor.mag = WEAPONS[playerActor.weapon].mag;
-  playerActor.reserve = WEAPONS[playerActor.weapon].reserve;
+  if (!playerActor.survived) {
+    // The dead start over: sidearm, no armour, full fresh ammunition.
+    playerActor.weapon = 'p9'; playerActor.armor = 0; playerActor.ownedPrimary = null;
+    playerActor.mag = WEAPONS.p9.mag;
+    playerActor.reserve = WEAPONS.p9.reserve;
+    for (const k of Object.keys(ammoStore)) ammoStore[k] = null;
+  }
+  // Survivors keep their weapon, armour and the exact ammunition they
+  // ended the round with — no free refill between rounds.
   playerActor.grenades = { frag: 0, smoke: 0, flash: 0 };
   playerActor.survived = false;
   const enemyTeam = state.playerTeam === 'lanterns' ? 'harbour' : 'lanterns';
-  bots.forEach((b, i) => {
-    const s = map.spawns[b.team][i % 5];
+  const seat = { lanterns: 0, harbour: 0 };
+  bots.forEach((b) => {
+    // Seat each team in its own spawn slots; the player's team leaves slot 0
+    // for the player (the old indexing put a teammate on the player's spot).
+    const idx = b.team === state.playerTeam ? seat[b.team] + 1 : seat[b.team];
+    seat[b.team] += 1;
+    const s = map.spawns[b.team][idx % 5];
     b.pos.set(s.x, 0, s.z);
-    b.yaw = b.team === 'lanterns' ? 0 : Math.PI;
+    b.yaw = b.team === 'lanterns' ? Math.PI : 0;
     b.hp = 100;
     b.alive = true;
     b.mesh.visible = true;
@@ -179,6 +209,7 @@ function startRound() {
     b.ai.hold = null;
     b.ai.target = null;
     b.ai.site = null;
+    b.ai.carrier = false;
     b.ai.plantProgress = 0;
     b.ai.defuseProgress = 0;
     b.ai.blindUntil = 0;
@@ -254,8 +285,10 @@ function buyItem(key) {
   } else if (WEAPONS[key]) {
     if (m >= WEAPONS[key].price) {
       playerActor.money -= WEAPONS[key].price;
+      stashAmmo();
       playerActor.weapon = key;
       playerActor.ownedPrimary = key;
+      ammoStore[key] = { mag: WEAPONS[key].mag, reserve: WEAPONS[key].reserve };
       playerActor.mag = WEAPONS[key].mag;
       playerActor.reserve = WEAPONS[key].reserve;
       audio.click();
@@ -274,9 +307,11 @@ function toggleBuy() {
 
 function selectWeapon(key) {
   if (key === 'p9' || (playerActor.ownedPrimary && key === playerActor.ownedPrimary)) {
-    playerActor.weapon = key;
-    playerActor.mag = WEAPONS[key].mag;
-    playerActor.reserve = WEAPONS[key].reserve;
+    if (key !== playerActor.weapon) {
+      stashAmmo();
+      playerActor.weapon = key;
+      drawAmmo(key);
+    }
     syncHud();
   }
 }
@@ -312,6 +347,8 @@ function shootPlayer() {
   camera.getWorldDirection(shootDir);
   const pellets = w.pellets || 1;
   let anyHit = false;
+  // The raycast target list is built once per shot, not once per pellet.
+  const targets = [...map.shootables, ...bots.flatMap((b) => b.alive ? [b.figure.head, b.figure.torso, b.figure.legL, b.figure.legR] : [])];
   for (let p = 0; p < pellets; p += 1) {
     const dir = shootDir.clone();
     dir.x += (rng() * 2 - 1) * spread;
@@ -319,7 +356,6 @@ function shootPlayer() {
     dir.z += (rng() * 2 - 1) * spread;
     dir.normalize();
     raycaster.set(camera.position, dir);
-    const targets = [...map.shootables, ...bots.flatMap((b) => b.alive ? [b.figure.head, b.figure.torso, b.figure.legL, b.figure.legR] : [])];
     const hit = raycaster.intersectObjects(targets, false)[0];
     const end = hit ? hit.point : camera.position.clone().addScaledVector(dir, 80);
     effects.tracer(camera.position.clone().addScaledVector(dir, 0.6), end);
@@ -688,11 +724,11 @@ function runShot(name) {
     // teammate on the flank, a smoke cloud blooming, a tracer in the air.
     const enemy = bots.find((b) => b.team === 'harbour');
     enemy.pos.set(0.9, 0, 0);
-    enemy.yaw = Math.PI;
+    enemy.yaw = -0.15; // facing the player, so the shot reads as a duel
     enemy.hp = 62;
     const mate = bots.find((b) => b.team === 'lanterns');
     mate.pos.set(-5, 0, 0);
-    mate.yaw = 0.3;
+    mate.yaw = 3.0; // facing up mid, covering the push
     effects.smoke(6, -3, elapsed + 30);
     effects.tracer(new THREE.Vector3(0.3, 1.5, 5.4), new THREE.Vector3(0.9, 1.4, 0));
     hud.addFeed('Ember <span style="color:#f0a830">[KR-7 Carbine]</span> Breaker', 'lanterns');
@@ -707,15 +743,17 @@ function runShot(name) {
     state.round = 7;
     hud.showBuy(false, 0, { armor: 0 });
     buyOpen = false;
-    player.reset(-14, -3, 0.46);
+    // The planter stands inside site A (the old staging stood 5.6 m away,
+    // outside the site radius, while the HUD claimed a plant at site A).
+    player.reset(-15, -5, 0.46);
     playerActor.weapon = 'kr7';
     playerActor.ownedPrimary = 'kr7';
     playerActor.mag = 18;
     playerActor.money = 2100;
     for (let i = 0; i < 20; i += 1) step(FIXED_STEP);
     const enemy = bots.find((b) => b.team === 'harbour');
-    enemy.pos.set(-14.5, 0, -10);
-    enemy.yaw = 0.07;
+    enemy.pos.set(-18, 0, -9);
+    enemy.yaw = 0.64; // facing the planter
     plantProgress = PLANT_SECONDS * 0.62;
     hud.setPlantProgress(0.62, 'PLANTING AT SITE A');
     player.state.yaw = 0.46;

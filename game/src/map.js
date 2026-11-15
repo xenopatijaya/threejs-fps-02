@@ -29,21 +29,24 @@ const WAYPOINTS = {
   spawnH: { x: 0, z: -12.5, to: ['midNorth', 'aHold1', 'bHold1'] },
   midSouth: { x: 0, z: 8, to: ['spawnL', 'mid', 'aLong1', 'bLong1'] },
   mid: { x: 0, z: 0, to: ['midSouth', 'midNorth', 'aMid', 'bMid'] },
-  midNorth: { x: 0, z: -6, to: ['mid', 'spawnH', 'aMid', 'bMid'] },
+  midNorth: { x: 0, z: -6, to: ['mid', 'spawnH', 'aMid', 'bMid', 'midHold', 'midHold2'] },
   aLong1: { x: -19, z: 8, to: ['spawnL', 'midSouth', 'aLong2'] },
   aLong2: { x: -19, z: 0, to: ['aLong1', 'aLong3', 'aMid'] },
   aLong3: { x: -19, z: -6, to: ['aLong2', 'siteA', 'aHold2'] },
-  siteA: { x: -16.5, z: -8, to: ['aLong3', 'aHold1', 'aMid'] },
+  // Waypoints must sit on open ground: siteA used to be the shrine altar's
+  // own spot, bMid inside a stall, aHold1/aHold2/bHold2 inside containers —
+  // bots routed there pressed against the box forever and never arrived.
+  siteA: { x: -16.5, z: -5.6, to: ['aLong3', 'aHold1', 'aMid'] },
   bLong1: { x: 19, z: 8, to: ['spawnL', 'midSouth', 'bLong2'] },
   bLong2: { x: 19, z: 0, to: ['bLong1', 'bLong3', 'bMid'] },
   bLong3: { x: 19, z: -6, to: ['bLong2', 'siteB', 'bHold2'] },
   siteB: { x: 16.5, z: -8, to: ['bLong3', 'bHold1', 'bMid'] },
   aMid: { x: -10, z: -4, to: ['mid', 'midNorth', 'aLong2', 'siteA'] },
-  bMid: { x: 10, z: -4, to: ['mid', 'midNorth', 'bLong2', 'siteB'] },
-  aHold1: { x: -13, z: -11.5, to: ['siteA', 'spawnH', 'midNorth'] },
-  aHold2: { x: -18.5, z: -11.5, to: ['aLong3', 'siteA'] },
+  bMid: { x: 10, z: -2.2, to: ['mid', 'midNorth', 'bLong2', 'siteB'] },
+  aHold1: { x: -12, z: -10.5, to: ['siteA', 'spawnH', 'midNorth'] },
+  aHold2: { x: -16, z: -11.5, to: ['aLong3', 'siteA'] },
   bHold1: { x: 13, z: -11.5, to: ['siteB', 'spawnH', 'midNorth'] },
-  bHold2: { x: 18.5, z: -11.5, to: ['bLong3', 'siteB'] },
+  bHold2: { x: 15.5, z: -9.5, to: ['bLong3', 'siteB'] },
   midHold: { x: -3, z: -9.5, to: ['midNorth', 'aHold1'] },
   midHold2: { x: 3, z: -9.5, to: ['midNorth', 'bHold1'] },
 };
@@ -115,7 +118,13 @@ export function hasLOS(ax, ay, az, bx, by, bz, colliders) {
 // Circle (actor) vs 2D AABB resolve, per axis, so actors slide along walls.
 export function resolveMove(pos, radius, moveBoxes) {
   for (const b of moveBoxes) {
-    if (pos.y >= b.h) continue; // low enough to step over? no: all boxes block at ground level
+    // A box blocks only where it crosses the actor's body span (feet to
+    // head). The market roof, the stall awnings and the shrine roof all sit
+    // above head height: treating them as ground walls made mid and site A
+    // unusable — actors were shoved out of the footprint sideways, and the
+    // site A bomb could never be reached to defuse it.
+    if (pos.y + 1.7 <= b.y0) continue;
+    if (pos.y >= b.y0 + b.h) continue;
     if (pos.x + radius > b.x0 && pos.x - radius < b.x1 && pos.z + radius > b.z0 && pos.z - radius < b.z1) {
       const dxl = pos.x + radius - b.x0;
       const dxr = b.x1 - (pos.x - radius);
@@ -180,7 +189,9 @@ export function createMap(scene) {
     const b3 = new THREE.Box3().setFromObject(mesh);
     if (solid) {
       colliders.push(b3);
-      moveBoxes.push({ x0: x - w / 2, x1: x + w / 2, z0: z - d / 2, z1: z + d / 2, h });
+      // y0 is the box's underside: overhead boxes (roofs, awnings) must not
+      // act as ground-level walls — resolveMove tests actors against it.
+      moveBoxes.push({ x0: x - w / 2, x1: x + w / 2, z0: z - d / 2, z1: z + d / 2, h, y0: y - h / 2 });
     }
     shootables.push(mesh);
     return mesh;
@@ -217,7 +228,7 @@ export function createMap(scene) {
     [-6, 1.1, 1.1, -9], [6, 1.1, 1.1, -9], [-2, 1.1, 1.1, -11.5],
     [2, 1.1, 1.1, -11.5], [-19, 1.1, 1.1, 3], [19, 1.1, 1.1, 3],
   ];
-  for (const [cx, ch, cd, cz] of crates) box(cx === -14 || cx === 14 ? 1.2 : 1.2, ch, cd, cx, ch / 2, cz, 'wood');
+  for (const [cx, ch, cd, cz] of crates) box(1.2, ch, cd, cx, ch / 2, cz, 'wood');
   // Containers at the Docks (site B) and a stack at the Shrine (site A).
   box(5.2, 2.6, 2.4, 18.5, 1.3, -11.5, 'container');
   box(5.2, 2.6, 2.4, 13.5, 1.3, -13, 'containerBlue');

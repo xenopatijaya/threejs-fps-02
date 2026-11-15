@@ -36,7 +36,9 @@ export function createBot(team, name, spawn, isCarrier, rng) {
   const actor = {
     id, name, team, isPlayer: false, isBot: true,
     pos: new THREE.Vector3(spawn.x, 0, spawn.z),
-    yaw: team === 'lanterns' ? 0 : Math.PI, pitch: 0,
+    // Bot yaw follows atan2(dx, dz): PI faces -Z (north), 0 faces +Z (south).
+    // Each team spawns facing the sites, not its own rear wall.
+    yaw: team === 'lanterns' ? Math.PI : 0, pitch: 0,
     hp: 100, armor: 0, alive: true,
     weapon: 'kr7', mag: WEAPONS.kr7.mag, reserve: WEAPONS.kr7.reserve,
     grenades: { frag: 0, smoke: 0, flash: 0 },
@@ -151,41 +153,47 @@ export function stepBots(bots, ctx, dt) {
       ai.thinkAt = now + 0.12 + rng() * 0.08;
       think(bot, ctx);
     }
-    // Vision: scan the player and the enemy bots.
-    const enemies = [player, ...bots.filter((b) => b.team !== bot.team && b !== bot)];
-    let seen = null;
-    let seenD = Infinity;
-    for (const e of enemies) {
-      if (!e.alive) continue;
-      if (canSee(bot, e, map, smokeClouds, now)) {
-        const d = Math.hypot(e.pos.x - bot.pos.x, e.pos.z - bot.pos.z);
-        if (d < seenD) { seenD = d; seen = e; }
+    // Vision, hearing and acting happen only while the round is live: in the
+    // buy phase the teams are still in their spawns and nobody may fight.
+    // The player is a target only for bots on the other team — the scan used
+    // to include the player unconditionally, so teammates shot their own
+    // bomb carrier in the spawn.
+    if (state.phase === 'live') {
+      const enemies = [player, ...bots].filter((a) => a.team !== bot.team && a !== bot);
+      let seen = null;
+      let seenD = Infinity;
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        if (canSee(bot, e, map, smokeClouds, now)) {
+          const d = Math.hypot(e.pos.x - bot.pos.x, e.pos.z - bot.pos.z);
+          if (d < seenD) { seenD = d; seen = e; }
+        }
       }
-    }
-    if (seen) {
-      if (!ai.target) ai.reactAt = now + 0.28 + rng() * 0.25;
-      ai.target = seen;
-      ai.lastSeen = { x: seen.pos.x, z: seen.pos.z, at: now };
-    } else if (ai.target && now - (ai.lastSeen?.at ?? 0) > 2.5) {
-      ai.target = null;
-    }
-    // Hearing: recent gunfire pulls bots toward it.
-    if (!ai.target && state.lastShotAt && now - state.lastShotAt.at < 1.2) {
-      const d = Math.hypot(state.lastShotAt.x - bot.pos.x, state.lastShotAt.z - bot.pos.z);
-      if (d < 26 && ai.role === 'defend') {
-        ai.hold = { x: state.lastShotAt.x, z: state.lastShotAt.z };
+      if (seen) {
+        if (!ai.target) ai.reactAt = now + 0.28 + rng() * 0.25;
+        ai.target = seen;
+        ai.lastSeen = { x: seen.pos.x, z: seen.pos.z, at: now };
+      } else if (ai.target && (!ai.target.alive || now - (ai.lastSeen?.at ?? 0) > 2.5)) {
+        ai.target = null;
       }
-    }
-    // Act.
-    if (ai.target && now >= ai.reactAt) {
-      engage(bot, ai.target, ctx, dt, now);
-    } else if (ai.defuseProgress > 0 || ai.plantProgress > 0) {
-      // channeling: stand still
-    } else if (ai.path.length) {
-      const wp = ai.path[0];
-      if (moveToward(bot, wp.x, wp.z, dt, map)) ai.path.shift();
-    } else if (ai.hold) {
-      moveToward(bot, ai.hold.x, ai.hold.z, dt, map, SPEED * 0.6);
+      // Hearing: recent gunfire pulls bots toward it.
+      if (!ai.target && state.lastShotAt && now - state.lastShotAt.at < 1.2) {
+        const d = Math.hypot(state.lastShotAt.x - bot.pos.x, state.lastShotAt.z - bot.pos.z);
+        if (d < 26 && ai.role === 'defend') {
+          ai.hold = { x: state.lastShotAt.x, z: state.lastShotAt.z };
+        }
+      }
+      // Act.
+      if (ai.target && now >= ai.reactAt) {
+        engage(bot, ai.target, ctx, dt, now);
+      } else if (ai.defuseProgress > 0 || ai.plantProgress > 0) {
+        // channeling: stand still
+      } else if (ai.path.length) {
+        const wp = ai.path[0];
+        if (moveToward(bot, wp.x, wp.z, dt, map)) ai.path.shift();
+      } else if (ai.hold) {
+        moveToward(bot, ai.hold.x, ai.hold.z, dt, map, SPEED * 0.6);
+      }
     }
     // Objective channels.
     channelObjective(bot, ctx, dt, now);
@@ -202,6 +210,22 @@ function think(bot, ctx) {
   if (state.phase !== 'live') return;
   if (ai.role === 'attack') {
     if (!ai.site) ai.site = pickSite(rng);
+    if (state.bomb.state === 'carried') ai.hold = null; // no standing orders while the charge moves
+    if (state.bomb.state === 'dropped' && state.bomb.pos) {
+      // The charge is on the ground: fetch it before pushing a site. The
+      // fetch preempts a route planned before the drop (the hold marks a
+      // bot as already fetching; others turn around at once). A bot already
+      // standing by the charge's nearest waypoint is not re-routed to that
+      // waypoint — it walks the last stretch straight to the charge.
+      const dBomb = Math.hypot(bot.pos.x - state.bomb.pos.x, bot.pos.z - state.bomb.pos.z);
+      const fetching = ai.hold && ai.hold.x === state.bomb.pos.x && ai.hold.z === state.bomb.pos.z;
+      const wpId = nearestWaypoint(state.bomb.pos.x, state.bomb.pos.z);
+      const wp = map.waypoints[wpId];
+      const dWp = Math.hypot(bot.pos.x - wp.x, bot.pos.z - wp.z);
+      if ((!fetching || !ai.path.length) && dBomb > 2 && dWp > 1.2) planRoute(bot, wpId, map);
+      ai.hold = { x: state.bomb.pos.x, z: state.bomb.pos.z };
+      return;
+    }
     const bombPlanted = state.bomb.state === 'planted';
     if (bombPlanted) {
       // After the plant, attackers guard the bomb.
@@ -237,15 +261,17 @@ function think(bot, ctx) {
 }
 
 function engage(bot, target, ctx, dt, now) {
-  const { rng, onBotShot } = ctx;
+  const { rng, onBotShot, map } = ctx;
   const dx = target.pos.x - bot.pos.x;
   const dz = target.pos.z - bot.pos.z;
   const dist = Math.hypot(dx, dz) || 1;
   bot.yaw = Math.atan2(dx, dz);
-  // Strafe a little while firing so the fight moves.
+  // Strafe a little while firing so the fight moves — through collision, so
+  // a strafing bot cannot slide through crates and walls.
   const strafe = Math.sin(now * 1.7 + bot.id.charCodeAt(4)) * 0.5;
   bot.pos.x += Math.cos(bot.yaw) * strafe * dt * 1.4;
   bot.pos.z -= Math.sin(bot.yaw) * strafe * dt * 1.4;
+  resolveMove(bot.pos, 0.38, map.moveBoxes);
   if (now < bot.ai.nextShotAt) return;
   if (bot.ai.burstLeft <= 0) {
     bot.ai.burstLeft = 3 + Math.floor(rng() * 3);
@@ -269,7 +295,8 @@ function channelObjective(bot, ctx, dt, now) {
   // Attackers plant.
   if (ai.carrier && state.bomb.state === 'carried' && state.bomb.carrier === bot.id) {
     const siteId = ai.site;
-    const s = map.sites[siteId];
+    const s = siteId ? map.sites[siteId] : null;
+    if (!s) return; // no site picked yet — the next think assigns one
     const d = Math.hypot(bot.pos.x - s.x, bot.pos.z - s.z);
     if (d < s.r && !ai.target) {
       if (ai.plantProgress === 0) onPlantStart(bot, siteId);
